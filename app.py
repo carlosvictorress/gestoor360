@@ -10,6 +10,7 @@ import qrcode
 import base64
 import re
 import math
+
 from functools import wraps
 from datetime import datetime, timedelta
 from flask import session, flash, redirect, url_for
@@ -28,6 +29,9 @@ from flask import (
     abort,
     jsonify,
 )
+
+import click
+
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_bcrypt import Bcrypt
@@ -54,7 +58,7 @@ from reportlab.platypus import (
 )
 from reportlab.pdfgen import canvas as canvas_lib
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from reportlab.lib.units import cm, inch
 
 # Configura o locale para o português do Brasil
@@ -70,36 +74,33 @@ except locale.Error:
 app = Flask(__name__)
 basedir = os.path.abspath(os.path.dirname(__file__))
 
-# --- Configurações da Aplicação ---
+
+# --- CÓDIGO CORRIGIDO ---
 database_url = os.environ.get("DATABASE_URL")
 
-# Verifica se a DATABASE_URL foi definida no ambiente
-if database_url and database_url.startswith("postgres://"):
-    # Corrige o dialeto para o SQLAlchemy, caso venha de serviços como o Heroku/Hostinger
-    database_url = database_url.replace("postgres://", "postgresql://", 1)
+# A condição foi ajustada para 'postgresql://'
+if database_url and database_url.startswith("postgresql://"):
     app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 else:
     # Se não houver DATABASE_URL, usa o banco de dados SQLite local
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(
-        basedir, "servidores.db"
-    )
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(basedir, "servidores.db")
 
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SECRET_KEY"] = "uma-chave-secreta-muito-dificil-de-adivinhar"
 app.config["UPLOAD_FOLDER"] = "uploads"
 RAIO_PERMITIDO_METROS = 100
 
 # --- Inicialização das Extensões ---
-db = SQLAlchemy(app)
-migrate = Migrate(app, db)
-bcrypt = Bcrypt(app)
+from extensions import db, bcrypt
 
+db.init_app(app)
+bcrypt.init_app(app)
+migrate = Migrate(app, db)
 
 # ===================================================================
 # PARTE 3: Importação dos Modelos
 # ===================================================================
-from .models import *
+from models import *
 
 
 # ===================================================================
@@ -183,15 +184,80 @@ def create_admin_command():
     with app.app_context():
         username = input("Digite o nome de usuário para o admin: ")
         password = input("Digite a senha para o admin: ")
+
+        # Lista as secretarias disponíveis
+        secretarias = Secretaria.query.all()
+        if not secretarias:
+            print("Erro: Nenhuma secretaria encontrada. Crie uma primeiro com 'flask add-secretaria'.")
+            return
+
+        print("Selecione a secretaria para este usuário:")
+        for i, sec in enumerate(secretarias):
+            print(f"  {i + 1}: {sec.nome}")
+
+        while True:
+            try:
+                choice = int(input("Digite o número da secretaria: "))
+                if 1 <= choice <= len(secretarias):
+                    secretaria_selecionada = secretarias[choice - 1]
+                    break
+                else:
+                    print("Seleção inválida. Tente novamente.")
+            except ValueError:
+                print("Por favor, digite um número.")
+
         user = User.query.filter_by(username=username).first()
         if user:
-            print(f"Usuário '{username}' já existe.")
-            return
-        hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
-        new_user = User(username=username, password_hash=hashed_password, role="admin")
-        db.session.add(new_user)
+            print(f"Usuário '{username}' já existe. Atualizando secretaria.")
+            user.secretaria_id = secretaria_selecionada.id
+        else:
+            hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
+            new_user = User(
+                username=username, 
+                password_hash=hashed_password, 
+                role="admin",
+                secretaria_id=secretaria_selecionada.id
+            )
+            db.session.add(new_user)
+
         db.session.commit()
-        print(f"Usuário administrador '{username}' criado com sucesso!")
+        print(f"Usuário administrador '{username}' criado/atualizado com sucesso na secretaria '{secretaria_selecionada.nome}'!")
+
+
+@app.cli.command("add-secretaria")
+@click.argument("nome")
+def add_secretaria_command(nome):
+    """Cria uma nova secretaria a partir da linha de comando."""
+    if Secretaria.query.filter_by(nome=nome).first():
+        print(f"Erro: A secretaria '{nome}' já existe.")
+        return
+    nova_secretaria = Secretaria(nome=nome)
+    db.session.add(nova_secretaria)
+    db.session.commit()
+    print(f"Secretaria '{nome}' criada com sucesso!")
+
+
+
+
+
+
+@app.cli.command("init-licence")
+def init_licence_command():
+    """Cria uma licença inicial para o sistema."""
+    with app.app_context():
+        if License.query.first():
+            print("Erro: A licença já existe na base de dados.")
+            return
+
+        # Cria uma licença que expira em 30 dias a partir de agora
+        expiration = datetime.utcnow() + timedelta(days=30)
+        new_licence = License(expiration_date=expiration)
+        db.session.add(new_licence)
+        db.session.commit()
+        print(f"Licença inicial criada com sucesso! Expira em: {expiration.strftime('%d/%m/%Y')}")
+
+
+
 
 
 @app.context_processor
@@ -278,6 +344,45 @@ def cabecalho_e_rodape(canvas, doc):
 # ===================================================================
 # PARTE 5: Definição das Rotas da Aplicação
 # ===================================================================
+
+
+
+
+
+@app.route("/requerimentos/editar/<int:req_id>", methods=['GET', 'POST'])
+@login_required
+@role_required('RH', 'admin')
+def editar_requerimento(req_id):
+    requerimento = Requerimento.query.get_or_404(req_id)
+    if request.method == 'POST':
+        try:
+            # Atualiza os dados do requerimento a partir do formulário
+            requerimento.autoridade_dirigida = request.form.get('autoridade_dirigida')
+            requerimento.natureza = request.form.get('natureza')
+            requerimento.natureza_outro = request.form.get('natureza_outro') if requerimento.natureza == 'Outro' else None
+            data_admissao_str = request.form.get('data_admissao')
+            requerimento.data_admissao = datetime.strptime(data_admissao_str, '%Y-%m-%d').date() if data_admissao_str else None
+            data_inicio_req_str = request.form.get('data_inicio_requerimento')
+            requerimento.data_inicio_requerimento = datetime.strptime(data_inicio_req_str, '%Y-%m-%d').date() if data_inicio_req_str else None
+            requerimento.duracao = request.form.get('duracao')
+            requerimento.periodo_aquisitivo = request.form.get('periodo_aquisitivo')
+            requerimento.informacoes_complementares = request.form.get('informacoes_complementares')
+            requerimento.parecer_juridico = request.form.get('parecer_juridico')
+
+            db.session.commit()
+            flash('Requerimento atualizado com sucesso!', 'success')
+            return redirect(url_for('listar_requerimentos'))
+        except Exception as e:
+            db.session.rollback()
+            flash(f'Erro ao atualizar o requerimento: {e}', 'danger')
+
+    return render_template('editar_requerimento.html', requerimento=requerimento)
+
+
+
+
+
+
 @app.route("/requerimentos/mudar-status-modal", methods=["POST"])
 @login_required
 @role_required("RH", "admin")
@@ -816,6 +921,7 @@ def delete_usuario(id):
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    print(f"DEBUG: A aplicação está a usar a base de dados: {app.config['SQLALCHEMY_DATABASE_URI']}")
     if request.method == "POST":
         username = request.form.get("usuario")
         password = request.form.get("senha")
@@ -1943,14 +2049,67 @@ def novo_requerimento():
     return render_template("requerimento_form.html")
 
 
+
 @app.route("/requerimento/pdf/<int:req_id>")
 @login_required
-@role_required("RH", "admin")
+@role_required('RH', 'admin')
 def gerar_requerimento_pdf(req_id):
     requerimento = Requerimento.query.get_or_404(req_id)
-    # ... (sua lógica de geração de PDF) ...
-    # Exemplo simples:
-    return f"Gerando PDF para o requerimento {requerimento.id} do servidor {requerimento.servidor.nome}"
+    servidor = requerimento.servidor
+
+    buffer = io.BytesIO()
+    # Ajuste as margens para corresponder ao seu modelo
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=1*cm, bottomMargin=1*cm)
+    
+    styles = getSampleStyleSheet()
+    # Crie os estilos necessários com os nomes corretos
+    styles.add(ParagraphStyle(name='Justify', alignment=TA_JUSTIFY, fontSize=12, leading=14))
+    styles.add(ParagraphStyle(name='Center', alignment=TA_CENTER, fontSize=12, leading=14))
+    styles.add(ParagraphStyle(name='Right', alignment=TA_RIGHT, fontSize=10))
+    styles.add(ParagraphStyle(name='BoldCenter', parent=styles['Center'], fontName='Helvetica-Bold'))
+
+    story = []
+
+    # Cabeçalho
+    story.append(Paragraph("<u>REQUERIMENTO</u>", styles['BoldCenter']))
+    story.append(Spacer(1, 1*cm))
+
+    # Autoridade
+    story.append(Paragraph(f"EXMO(A). SR(A). {requerimento.autoridade_dirigida}", styles['Normal']))
+    story.append(Paragraph("Secretário(a) Municipal de Educação", styles['Normal']))
+    story.append(Spacer(1, 1*cm))
+
+    # Corpo do texto
+    texto_requerimento = f"""
+        {servidor.nome}, brasileiro(a), servidor(a) público(a) municipal, portador(a) do CPF nº {servidor.cpf},
+        lotado(a) na Secretaria Municipal de Educação, na função de {servidor.funcao}, vem, respeitosamente,
+        à presença de Vossa Excelência, requerer a concessão de <b>{requerimento.natureza}</b>, a partir do dia
+        {requerimento.data_inicio_requerimento.strftime('%d/%m/%Y') if requerimento.data_inicio_requerimento else ''}.
+    """
+    story.append(Paragraph(texto_requerimento, styles['Justify']))
+    story.append(Spacer(1, 1*cm))
+    
+    story.append(Paragraph("Nestes termos, pede deferimento.", styles['Normal']))
+    story.append(Spacer(1, 2*cm))
+
+    # Data
+    story.append(Paragraph(f"Valença do Piauí, {datetime.now().strftime('%d de %B de %Y')}", styles['Center']))
+    story.append(Spacer(1, 2*cm))
+    
+    # Assinatura
+    story.append(Paragraph("____________________________________________", styles['Center']))
+    story.append(Paragraph(servidor.nome, styles['Center']))
+    story.append(Paragraph("Requerente", styles['Center']))
+
+    doc.build(story)
+    buffer.seek(0)
+
+    response = make_response(buffer.getvalue())
+    response.headers['Content-Type'] = 'application/pdf'
+    response.headers['Content-Disposition'] = f'inline; filename=requerimento_{req_id}.pdf'
+    
+    return response
+
 
 
 @app.route("/combustivel", methods=["GET", "POST"])
@@ -2167,15 +2326,15 @@ def debug_sessao():
 # ===================================================================
 # PARTE 6: Importação e Registro dos Blueprints
 # ===================================================================
-from .patrimonio_routes import patrimonio_bp
-from .merenda_routes import merenda_bp
-from .motoristas_routes import motoristas_bp
-from .escola_routes import escola_bp
-from .transporte_routes import transporte_bp
-from .protocolo_routes import protocolo_bp
-from .contratos_routes import contratos_bp
-from .frequencia_routes import frequencia_bp
-from .backup_routes import backup_bp
+from patrimonio_routes import patrimonio_bp
+from merenda_routes import merenda_bp
+from motoristas_routes import motoristas_bp
+from escola_routes import escola_bp
+from transporte_routes import transporte_bp
+from protocolo_routes import protocolo_bp
+from contratos_routes import contratos_bp
+from frequencia_routes import frequencia_bp
+from backup_routes import backup_bp
 
 app.register_blueprint(transporte_bp)
 app.register_blueprint(protocolo_bp)
